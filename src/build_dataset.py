@@ -54,10 +54,14 @@ def _get(url, tries=6, base_delay=4.0):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
+                status = resp.status
                 body = resp.read().decode("utf-8", "replace")
             # The WikiTree API answers 200 even for "Limit exceeded"; detect it.
-            if '"Limit exceeded"' in body or "Limit exceeded" in body:
+            if "Limit exceeded" in body:
                 raise RuntimeError("rate limited (Limit exceeded)")
+            # Empty body / 202 Accepted: treat as transient and retry.
+            if not body.strip() or status == 202:
+                raise RuntimeError(f"empty/transient response (HTTP {status})")
             return body
         except Exception as e:  # noqa: BLE001 - we want to retry everything transient
             last = e

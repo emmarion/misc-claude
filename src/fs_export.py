@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Export your direct ancestral line (pedigree) from FamilySearch.
+
+Why a *pedigree* and not the whole tree: to look for gateway ancestors you only
+need your direct ancestors -- not cousins or descendants. Pedigree doubles every
+generation, so this walks UP with cutoffs that prune branches which cannot
+contain a colonial gateway (born ~1570-1697):
+
+  --max-generations   hard depth cap (default 15)
+  --stop-before-year  do not expand ancestors born before this year; they are
+                      older than the oldest gateway, so their parents are
+                      irrelevant (default 1500)
+  --birth-countries   optional allow-list; if an ancestor's birthplace is KNOWN
+                      and matches none of these, stop expanding that branch
+                      (e.g. a line that has clearly left the British Isles /
+                      colonial America). Off by default -- pruning on place is
+                      aggressive and places are often missing.
+
+Output: data/my_pedigree.csv (id, generation, name, surname, birth_year,
+birth_place, birth_country), and optionally a GEDCOM with --gedcom.
+
+Auth: supply an OAuth access token via --token or $FS_ACCESS_TOKEN, or run the
+built-in Authorization-Code+PKCE login with --login --client-id <APP_KEY>
+(register http://localhost:8642/callback as a redirect URI in your FS app).
+
+Standard library only. The network/auth layer is isolated from the traversal +
+cutoff logic so the latter can be unit-tested with fixtures (see tests/).
+"""
+
+import argparse
+import base64
+import csv
+import hashlib
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DATA = os.path.join(ROOT, "data")
+
+# FamilySearch hosts (production by default; --beta switches to the sandbox).
+HOSTS = {
+    "prod": {"api": "https://api.familysearch.org",
+             "ident": "https://ident.familysearch.org"},
+    "beta": {"api": "https://apibeta.familysearch.org",
+             "ident": "https://identbeta.familysearch.org"},
+}
+GEDCOMX = "application/x-gedcomx-v1+json"
+REDIRECT_URI = "http://localhost:8642/callback"
+
+
+# --------------------------------------------------------------------------- #
+# HTTP                                                                         #
+# --------------------------------------------------------------------------- #
+def http_get(url, token, accept=GEDCOMX, tries=5, base_delay=2.0):
+    for attempt in range(tries):
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": accept,
+            "User-Agent": "gateway-royalty-research/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8", "replace")
+            if not body.strip():
+                raise RuntimeError("empty body")
+            return json.loads(body)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503, 504):
+                delay = base_delay * (2 ** attempt)
+                sys.stderr.write(f"  ! HTTP {e.code}; retry in {delay:.0f}s\n")
+                time.sleep(delay)
+                continue
+            if e.code == 204:  # no content (e.g. no ancestry) -> treat as empty
+                return {}
+            raise
+        except Exception as e:  # noqa: BLE001
+            delay = base_delay * (2 ** attempt)
+            sys.stderr.write(f"  ! {e}; retry in {delay:.0f}s\n")
+            time.sleep(delay)
+    raise SystemExit(f"GET failed after {tries} tries: {url}")
+
+
+# --------------------------------------------------------------------------- #
+# OAuth (Authorization Code + PKCE)                                            #
+# --------------------------------------------------------------------------- #
+class _CodeCatcher(BaseHTTPRequestHandler):
+    code = None
+
+    def do_GET(self):  # noqa: N802
+        q = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(q)
+        _CodeCatcher.code = (params.get("code") or [None])[0]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h3>Authorized. You can close this tab.</h3>")
+
+    def log_message(self, *a):  # silence
+        pass
+
+
+def oauth_login(client_id, hosts):
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    auth_url = hosts["ident"] + "/cis-web/oauth2/v3/authorization?" + urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id,
+        "redirect_uri": REDIRECT_URI, "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    })
+    print("Opening browser to authorize with FamilySearch...")
+    print(auth_url)
+    webbrowser.open(auth_url)
+    srv = HTTPServer(("localhost", 8642), _CodeCatcher)
+    srv.handle_request()  # blocks for the single redirect
+    code = _CodeCatcher.code
+    if not code:
+        raise SystemExit("did not receive an authorization code")
+    data = urllib.parse.urlencode({
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": REDIRECT_URI, "client_id": client_id,
+        "code_verifier": verifier,
+    }).encode()
+    req = urllib.request.Request(hosts["ident"] + "/cis-web/oauth2/v3/token", data=data)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        tok = json.loads(resp.read().decode())
+    return tok["access_token"]
+
+
+# --------------------------------------------------------------------------- #
+# Parsing (pure -- unit-testable with fixtures)                               #
+# --------------------------------------------------------------------------- #
+def _year(date_obj):
+    """Pull a 4-digit year from a GEDCOM X date (formal '+1605' or original text)."""
+    if not isinstance(date_obj, dict):
+        return ""
+    formal = date_obj.get("formal", "")
+    import re
+    m = re.search(r"(\d{4})", formal) or re.search(r"\b(\d{4})\b", date_obj.get("original", "") or "")
+    return m.group(1) if m else ""
+
+
+def _name_parts(person):
+    """Return (given, surname, full) from a GEDCOM X person."""
+    given = surname = ""
+    for nm in person.get("names", []) or []:
+        for form in nm.get("nameForms", []) or []:
+            for part in form.get("parts", []) or []:
+                t = part.get("type", "")
+                if t.endswith("Given") and not given:
+                    given = part.get("value", "")
+                elif t.endswith("Surname") and not surname:
+                    surname = part.get("value", "")
+        if given or surname:
+            break
+    full = (person.get("display", {}) or {}).get("name", "") or f"{given} {surname}".strip()
+    if not surname and full:
+        surname = full.split()[-1]
+        given = given or " ".join(full.split()[:-1])
+    return given.strip(), surname.strip(), full.strip()
+
+
+def _birth(person):
+    """Return (birth_year, birth_place) from display or facts."""
+    disp = person.get("display", {}) or {}
+    year = ""
+    if disp.get("birthDate"):
+        import re
+        m = re.search(r"\b(\d{4})\b", disp["birthDate"])
+        year = m.group(1) if m else ""
+    place = disp.get("birthPlace", "") or ""
+    if not year or not place:
+        for fact in person.get("facts", []) or []:
+            if str(fact.get("type", "")).endswith("Birth"):
+                year = year or _year(fact.get("date", {}))
+                place = place or (fact.get("place", {}) or {}).get("original", "")
+    return year, place
+
+
+def _country(place):
+    return place.split(",")[-1].strip() if place else ""
+
+
+def parse_ancestry(gedcomx, gen_offset=0):
+    """Turn an FS ancestry response into person dicts keyed by FS id.
+
+    ascendancyNumber is Ahnentafel: 1=root(gen0), 2/3=parents(gen1), ...
+    generation = bit_length(ascNum) - 1, shifted by gen_offset for re-rooting.
+    """
+    out = {}
+    for p in gedcomx.get("persons", []) or []:
+        pid = p.get("id")
+        if not pid:
+            continue
+        disp = p.get("display", {}) or {}
+        asc = disp.get("ascendancyNumber")
+        try:
+            gen = (int(asc).bit_length() - 1) + gen_offset if asc else gen_offset
+        except (TypeError, ValueError):
+            gen = gen_offset
+        given, surname, full = _name_parts(p)
+        byr, bplace = _birth(p)
+        out[pid] = {
+            "id": pid, "generation": gen, "full_name": full,
+            "given": given, "surname": surname, "birth_year": byr,
+            "birth_place": bplace, "birth_country": _country(bplace),
+            "ascendancy": asc,
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Cutoff logic (pure)                                                          #
+# --------------------------------------------------------------------------- #
+def should_expand(person, max_generations, stop_before_year, birth_countries):
+    """Decide whether to fetch this person's ancestors. Missing data => keep
+    going (never prune on absence)."""
+    if person["generation"] >= max_generations:
+        return False
+    byr = person["birth_year"]
+    if byr and int(byr) < stop_before_year:
+        return False  # older than any gateway -> their parents are irrelevant
+    if birth_countries and person["birth_place"]:
+        place = person["birth_place"].lower()
+        if not any(c.lower().strip() in place for c in birth_countries):
+            return False  # known birthplace has left the relevant geography
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Traversal                                                                    #
+# --------------------------------------------------------------------------- #
+def fetch_ancestry(pid, token, hosts, generations=8):
+    url = hosts["api"] + "/platform/tree/ancestry?" + urllib.parse.urlencode({
+        "person": pid, "generations": generations, "personDetails": "true",
+    })
+    return http_get(url, token, GEDCOMX)
+
+
+def current_person_id(token, hosts):
+    data = http_get(hosts["api"] + "/platform/tree/current-person", token, GEDCOMX)
+    persons = data.get("persons") or []
+    if not persons:
+        raise SystemExit("could not resolve current person; pass --root <PID>")
+    return persons[0]["id"]
+
+
+def export_pedigree(root_pid, token, hosts, max_generations, stop_before_year,
+                    birth_countries, pause=0.5):
+    """BFS up the pedigree, re-rooting ancestry calls (FS caps at 8 gens/call)."""
+    people = {}                      # id -> person dict (min generation kept)
+    frontier = [(root_pid, 0)]       # (pid, generation) still to expand
+    expanded = set()
+    while frontier:
+        pid, base_gen = frontier.pop(0)
+        if pid in expanded:
+            continue
+        expanded.add(pid)
+        sys.stderr.write(f"expanding {pid} (gen {base_gen})...\n")
+        chunk = parse_ancestry(fetch_ancestry(pid, token, hosts), gen_offset=base_gen)
+        time.sleep(pause)
+        for cid, person in chunk.items():
+            prev = people.get(cid)
+            if prev is None or person["generation"] < prev["generation"]:
+                people[cid] = person
+        # The chunk's deepest persons become the next frontier (re-root there).
+        max_gen_in_chunk = max((p["generation"] for p in chunk.values()), default=base_gen)
+        for cid, person in chunk.items():
+            if cid in expanded:
+                continue
+            # Only re-root at the leaves of this 8-gen chunk to avoid redundant calls.
+            if person["generation"] >= max_gen_in_chunk and should_expand(
+                    person, max_generations, stop_before_year, birth_countries):
+                frontier.append((cid, person["generation"]))
+    return people
+
+
+# --------------------------------------------------------------------------- #
+# Output                                                                       #
+# --------------------------------------------------------------------------- #
+def write_csv(people, path):
+    cols = ["id", "generation", "full_name", "given", "surname",
+            "birth_year", "birth_place", "birth_country"]
+    rows = sorted(people.values(), key=lambda p: (p["generation"], p["surname"]))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
+def write_gedcom(people, path):
+    rows = sorted(people.values(), key=lambda p: p["generation"])
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("0 HEAD\n1 SOUR gateway-royalty-research\n1 GEDC\n2 VERS 5.5.1\n1 CHAR UTF-8\n")
+        for i, p in enumerate(rows, 1):
+            fh.write(f"0 @I{i}@ INDI\n")
+            fh.write(f"1 NAME {p['given']} /{p['surname']}/\n")
+            if p["birth_year"] or p["birth_place"]:
+                fh.write("1 BIRT\n")
+                if p["birth_year"]:
+                    fh.write(f"2 DATE {p['birth_year']}\n")
+                if p["birth_place"]:
+                    fh.write(f"2 PLAC {p['birth_place']}\n")
+        fh.write("0 TRLR\n")
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                         #
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--token", default=os.environ.get("FS_ACCESS_TOKEN"),
+                    help="FamilySearch OAuth access token (or $FS_ACCESS_TOKEN)")
+    ap.add_argument("--login", action="store_true",
+                    help="run interactive OAuth login (needs --client-id)")
+    ap.add_argument("--client-id", default=os.environ.get("FS_CLIENT_ID"),
+                    help="your FamilySearch app key (for --login)")
+    ap.add_argument("--beta", action="store_true", help="use the FS sandbox hosts")
+    ap.add_argument("--root", help="root person FS id (default: the logged-in user)")
+    ap.add_argument("--max-generations", type=int, default=15)
+    ap.add_argument("--stop-before-year", type=int, default=1500)
+    ap.add_argument("--birth-countries", default="",
+                    help="comma-separated allow-list, e.g. 'England,Scotland,United States'")
+    ap.add_argument("--out", default=os.path.join(DATA, "my_pedigree.csv"))
+    ap.add_argument("--gedcom", help="also write a GEDCOM to this path")
+    ap.add_argument("--pause", type=float, default=0.5, help="seconds between API calls")
+    args = ap.parse_args()
+
+    hosts = HOSTS["beta" if args.beta else "prod"]
+
+    token = args.token
+    if args.login:
+        if not args.client_id:
+            sys.exit("--login requires --client-id <APP_KEY>")
+        token = oauth_login(args.client_id, hosts)
+        print("got access token (export it as FS_ACCESS_TOKEN to reuse)")
+    if not token:
+        sys.exit("no token: pass --token / set FS_ACCESS_TOKEN, or use --login")
+
+    root = args.root or current_person_id(token, hosts)
+    print(f"root person: {root}")
+    countries = [c for c in args.birth_countries.split(",") if c.strip()]
+    people = export_pedigree(root, token, hosts, args.max_generations,
+                             args.stop_before_year, countries, pause=args.pause)
+
+    n = write_csv(people, args.out)
+    print(f"wrote {n} direct ancestors -> {args.out}")
+    if args.gedcom:
+        write_gedcom(people, args.gedcom)
+        print(f"wrote GEDCOM -> {args.gedcom}")
+    # quick depth histogram
+    import collections
+    hist = collections.Counter(p["generation"] for p in people.values())
+    print("generations:", {g: hist[g] for g in sorted(hist)})
+
+
+if __name__ == "__main__":
+    main()

@@ -33,7 +33,7 @@ DEFAULT_OUT = os.path.join(ROOT, "data", "matches.csv")
 # --------------------------------------------------------------------------- #
 def parse_gedcom(path):
     """Yield dicts for each INDI: {id, given, surname, birth_year, birth_place,
-    death_year, death_place, full_name}."""
+    death_year, death_place, full_name, generation}."""
     people = []
     cur = None
     section = None  # which level-1 event we're inside (BIRT/DEAT/...)
@@ -58,7 +58,7 @@ def parse_gedcom(path):
                 if tag.startswith("@") and val == "INDI":
                     cur = {"id": tag.strip("@"), "given": "", "surname": "",
                            "full_name": "", "birth_year": "", "birth_place": "",
-                           "death_year": "", "death_place": ""}
+                           "death_year": "", "death_place": "", "generation": ""}
                 continue
 
             if cur is None:
@@ -101,6 +101,32 @@ def _set_name(rec, val):
 def _year(date_val):
     m = re.search(r"\b(\d{4})\b", date_val or "")
     return m.group(1) if m else ""
+
+
+def parse_pedigree_csv(path):
+    """Parse the CSV produced by fs_export.py into the same person shape."""
+    people = []
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        for row in csv.DictReader(fh):
+            full = row.get("full_name", "") or f"{row.get('given','')} {row.get('surname','')}".strip()
+            people.append({
+                "id": row.get("id", ""),
+                "given": row.get("given", "") or " ".join(full.split()[:-1]),
+                "surname": row.get("surname", "") or (full.split()[-1] if full else ""),
+                "full_name": full,
+                "birth_year": (row.get("birth_year", "") or "").strip(),
+                "birth_place": row.get("birth_place", ""),
+                "death_year": "", "death_place": "",
+                "generation": (row.get("generation", "") or "").strip(),
+            })
+    return people
+
+
+def load_people(path):
+    """Dispatch on extension: .csv => FS pedigree export, else GEDCOM."""
+    if path.lower().endswith(".csv"):
+        return parse_pedigree_csv(path)
+    return parse_gedcom(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +200,8 @@ def load_gateways(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("gedcom", help="path to your GEDCOM (.ged) export")
+    ap.add_argument("tree", help="your tree: a GEDCOM (.ged) or an "
+                                 "fs_export.py pedigree (.csv)")
     ap.add_argument("--gateways", default=DEFAULT_CSV, help="gateway_ancestors.csv")
     ap.add_argument("--out", default=DEFAULT_OUT, help="output CSV of matches")
     ap.add_argument("--min-score", type=float, default=0.62,
@@ -188,9 +215,9 @@ def main():
         sys.exit(f"gateway dataset not found: {args.gateways}\n"
                  f"run  python3 src/build_dataset.py  first.")
 
-    people = parse_gedcom(args.gedcom)
+    people = load_people(args.tree)
     gateways = load_gateways(args.gateways)
-    print(f"parsed {len(people)} individuals from {args.gedcom}")
+    print(f"parsed {len(people)} individuals from {args.tree}")
     print(f"comparing against {len(gateways)} gateway ancestors\n")
 
     matches = []
@@ -203,6 +230,7 @@ def main():
                 matches.append({
                     "score": round(s, 3),
                     "your_person": person["full_name"] or person["given"],
+                    "your_generation": person.get("generation", ""),
                     "your_birth": person["birth_year"],
                     "your_birth_place": person["birth_place"],
                     "gateway_name": gw["name"],
@@ -214,9 +242,9 @@ def main():
 
     matches.sort(key=lambda m: m["score"], reverse=True)
 
-    cols = ["score", "your_person", "your_birth", "your_birth_place",
-            "gateway_name", "gateway_birth", "gateway_birth_place",
-            "wikitree_url", "why"]
+    cols = ["score", "your_person", "your_generation", "your_birth",
+            "your_birth_place", "gateway_name", "gateway_birth",
+            "gateway_birth_place", "wikitree_url", "why"]
     with open(args.out, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
@@ -230,7 +258,8 @@ def main():
 
     print(f"found {len(matches)} candidate match(es); top {min(args.top, len(matches))}:\n")
     for m in matches[:args.top]:
-        print(f"  [{m['score']:.2f}] {m['your_person']} (b.{m['your_birth'] or '?'})"
+        gen = f" gen{m['your_generation']}" if m["your_generation"] else ""
+        print(f"  [{m['score']:.2f}] {m['your_person']} (b.{m['your_birth'] or '?'}{gen})"
               f"  ~  {m['gateway_name']} (b.{m['gateway_birth'] or '?'})")
         print(f"         {m['why']}")
         print(f"         {m['wikitree_url']}")

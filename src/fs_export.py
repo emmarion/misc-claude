@@ -7,14 +7,28 @@ generation, so this walks UP with cutoffs that prune branches which cannot
 contain a colonial gateway (born ~1570-1697):
 
   --max-generations   hard depth cap (default 15)
-  --stop-before-year  do not expand ancestors born before this year; they are
-                      older than the oldest gateway, so their parents are
-                      irrelevant (default 1500)
-  --birth-countries   optional allow-list; if an ancestor's birthplace is KNOWN
-                      and matches none of these, stop expanding that branch
-                      (e.g. a line that has clearly left the British Isles /
-                      colonial America). Off by default -- pruning on place is
-                      aggressive and places are often missing.
+  --stop-before-year  do not expand ancestors born before this year. A gateway
+                      IS the immigrant, born 1570-1697, so the year floor is the
+                      primary stopper: climb until births reach the bottom of
+                      that window, then stop. Default 1560 (just below the oldest
+                      gateway) brackets the whole window. Birth years are more
+                      reliably recorded than places, so this -- not the country
+                      filter -- does the real work.
+  --birth-countries   optional, DESCENDANT-SIDE allow-list (the Americas), to
+                      halt a line at the ocean crossing. A gateway is always the
+                      immigrant, so the first British-born ancestor on a line is
+                      the deepest point of interest; there are no gateways further
+                      up (their parents never emigrated). Recording is NOT gated
+                      by this filter -- the immigrant is still captured in the
+                      chunk triggered by their American-born child -- so an
+                      Americas-only list stops climbing right at the crossing.
+                      Do NOT add Britain: that makes you climb past the gateway
+                      into ancestry the books already cover. Off by default; its
+                      only real job is cheaply pruning non-British branches (e.g.
+                      a German line that immigrated in 1840). When matching the
+                      broader non-British gateways (Dutch/French/German), widen
+                      it to their origin or omit it. Pruning on place is risky --
+                      colonial place strings are messy -- so lean on the floor.
 
 Output: data/my_pedigree.csv (id, generation, name, surname, birth_year,
 birth_place, birth_country), and optionally a GEDCOM with --gedcom.
@@ -249,17 +263,24 @@ def parse_ancestry(gedcomx, gen_offset=0):
 # Cutoff logic (pure)                                                          #
 # --------------------------------------------------------------------------- #
 def should_expand(person, max_generations, stop_before_year, birth_countries):
-    """Decide whether to fetch this person's ancestors. Missing data => keep
-    going (never prune on absence)."""
+    """Decide whether to fetch this person's *ancestors*. This gates climbing,
+    not recording -- the person themselves is already captured. Missing data =>
+    keep going (never prune on absence)."""
     if person["generation"] >= max_generations:
         return False
     byr = person["birth_year"]
     if byr and int(byr) < stop_before_year:
-        return False  # older than any gateway -> their parents are irrelevant
+        # Primary stopper: once a line reaches below the gateway window the
+        # gateways on it are already captured, so stop climbing.
+        return False
     if birth_countries and person["birth_place"]:
         place = person["birth_place"].lower()
         if not any(c.lower().strip() in place for c in birth_countries):
-            return False  # known birthplace has left the relevant geography
+            # Descendant-side (Americas) list: a British-born ancestor falls
+            # through here and halts the climb at the ocean crossing -- which is
+            # correct, because the immigrant (already recorded) IS the gateway and
+            # nothing above them on this line can be one.
+            return False
     return True
 
 
@@ -416,9 +437,13 @@ def main():
     ap.add_argument("--beta", action="store_true", help="use the FS sandbox hosts")
     ap.add_argument("--root", help="root person FS id (default: the logged-in user)")
     ap.add_argument("--max-generations", type=int, default=15)
-    ap.add_argument("--stop-before-year", type=int, default=1500)
+    ap.add_argument("--stop-before-year", type=int, default=1560,
+                    help="stop expanding ancestors born before this (default 1560, "
+                         "just below the oldest gateway b.1570). Primary stopper.")
     ap.add_argument("--birth-countries", default="",
-                    help="comma-separated allow-list, e.g. 'England,Scotland,United States'")
+                    help="optional DESCENDANT-SIDE (Americas) allow-list to halt a "
+                         "line at the ocean crossing, e.g. 'United States,Virginia,"
+                         "Massachusetts,Maryland'. Do NOT add Britain. Off by default.")
     ap.add_argument("--out", default=os.path.join(DATA, "my_pedigree.csv"))
     ap.add_argument("--gedcom", help="also write a GEDCOM to this path")
     ap.add_argument("--pause", type=float, default=0.5, help="seconds between API calls")

@@ -76,6 +76,21 @@ def test_csv_roundtrip(tmp="/tmp/_ped_test.csv"):
     print("ok: write_csv")
 
 
+def test_retry_after_header():
+    class E:  # minimal stand-in for urllib HTTPError (.headers.get)
+        def __init__(self, h): self.headers = h
+    assert fx._retry_after(E({"Retry-After": "30"})) == 30.0
+    assert fx._retry_after(E({})) == 0.0
+    assert fx._retry_after(E(None)) == 0.0
+    assert fx._retry_after(E({"Retry-After": "not-a-number"})) == 0.0
+    # an HTTP-date a minute out -> roughly 60s (allow slack)
+    from email.utils import format_datetime
+    from datetime import datetime, timezone, timedelta
+    future = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=60))
+    assert 50 <= fx._retry_after(E({"Retry-After": future})) <= 61
+    print("ok: Retry-After parsing (seconds, date, missing, junk)")
+
+
 def test_cache_roundtrip(tmp="/tmp/_cache_test"):
     fx.cache_write(tmp, "ABC-1", {"persons": [{"id": "X"}]})
     assert fx.cache_read(tmp, "ABC-1") == {"persons": [{"id": "X"}]}
@@ -117,6 +132,7 @@ if __name__ == "__main__":
     test_gen_offset_for_rerooting()
     test_cutoffs()
     test_csv_roundtrip()
+    test_retry_after_header()
     test_cache_roundtrip()
     test_fetch_serves_from_cache_without_network()
     test_export_resumes_from_cache()

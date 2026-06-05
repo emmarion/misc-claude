@@ -60,6 +60,24 @@ REDIRECT_URI = "http://localhost:8642/callback"
 # --------------------------------------------------------------------------- #
 # HTTP                                                                         #
 # --------------------------------------------------------------------------- #
+def _retry_after(http_error):
+    """Seconds to wait per a 429/503 Retry-After header (int seconds or HTTP
+    date), or 0.0 if absent/unparseable."""
+    val = http_error.headers.get("Retry-After") if http_error.headers else None
+    if not val:
+        return 0.0
+    try:
+        return float(val)
+    except ValueError:
+        from email.utils import parsedate_to_datetime
+        from datetime import datetime
+        try:
+            dt = parsedate_to_datetime(val)
+            return max(0.0, (dt - datetime.now(dt.tzinfo)).total_seconds())
+        except (TypeError, ValueError):
+            return 0.0
+
+
 def http_get(url, token, accept=GEDCOMX, tries=5, base_delay=2.0):
     for attempt in range(tries):
         req = urllib.request.Request(url, headers={
@@ -75,8 +93,12 @@ def http_get(url, token, accept=GEDCOMX, tries=5, base_delay=2.0):
             return json.loads(body)
         except urllib.error.HTTPError as e:
             if e.code in (429, 502, 503, 504):
-                delay = base_delay * (2 ** attempt)
-                sys.stderr.write(f"  ! HTTP {e.code}; retry in {delay:.0f}s\n")
+                # Honor the server's Retry-After when present; otherwise back off
+                # exponentially. Never wait less than the server asks, and cap it.
+                backoff = base_delay * (2 ** attempt)
+                delay = min(max(backoff, _retry_after(e)), 120.0)
+                src = "Retry-After" if _retry_after(e) else "backoff"
+                sys.stderr.write(f"  ! HTTP {e.code}; retry in {delay:.0f}s ({src})\n")
                 time.sleep(delay)
                 continue
             if e.code == 204:  # no content (e.g. no ancestry) -> treat as empty

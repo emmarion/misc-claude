@@ -76,9 +76,48 @@ def test_csv_roundtrip(tmp="/tmp/_ped_test.csv"):
     print("ok: write_csv")
 
 
+def test_cache_roundtrip(tmp="/tmp/_cache_test"):
+    fx.cache_write(tmp, "ABC-1", {"persons": [{"id": "X"}]})
+    assert fx.cache_read(tmp, "ABC-1") == {"persons": [{"id": "X"}]}
+    assert fx.cache_read(tmp, "MISSING-9") is None
+    print("ok: cache read/write roundtrip")
+
+
+def test_fetch_serves_from_cache_without_network(tmp="/tmp/_cache_test2"):
+    fx.cache_write(tmp, "ROOT", ANCESTRY)
+    orig = fx.http_get
+    fx.http_get = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network used!"))
+    try:
+        data, from_cache = fx.fetch_ancestry("ROOT", token=None, hosts=fx.HOSTS["prod"],
+                                             cache_dir=tmp)
+        assert from_cache is True and data == ANCESTRY
+    finally:
+        fx.http_get = orig
+    print("ok: fetch_ancestry serves cache hit without network")
+
+
+def test_export_resumes_from_cache(tmp="/tmp/_cache_test3"):
+    # Pre-seed the cache for ROOT; its deepest ancestor (b.1450) is pruned by the
+    # year floor, so no further calls are needed -> the whole export runs offline.
+    fx.cache_write(tmp, "ROOT", ANCESTRY)
+    orig = fx.http_get
+    fx.http_get = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network used!"))
+    try:
+        people = fx.export_pedigree("ROOT", token=None, hosts=fx.HOSTS["prod"],
+                                    max_generations=15, stop_before_year=1500,
+                                    birth_countries=[], pause=0, cache_dir=tmp)
+        assert set(people) == {"ROOT", "DAD", "MOM", "OLD"}
+    finally:
+        fx.http_get = orig
+    print("ok: export_pedigree resumes entirely from cache (no network)")
+
+
 if __name__ == "__main__":
     test_parse_generations_and_fields()
     test_gen_offset_for_rerooting()
     test_cutoffs()
     test_csv_roundtrip()
+    test_cache_roundtrip()
+    test_fetch_serves_from_cache_without_network()
+    test_export_resumes_from_cache()
     print("\nALL TESTS PASSED")

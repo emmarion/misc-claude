@@ -81,6 +81,11 @@ def http_get(url, token, accept=GEDCOMX, tries=5, base_delay=2.0):
                 continue
             if e.code == 204:  # no content (e.g. no ancestry) -> treat as empty
                 return {}
+            if e.code in (401, 403):
+                raise SystemExit(
+                    f"HTTP {e.code}: token expired or unauthorized. Re-authenticate "
+                    "and run the same command again -- the on-disk cache preserves "
+                    "everything already fetched, so it resumes where it stopped.")
             raise
         except Exception as e:  # noqa: BLE001
             delay = base_delay * (2 ** attempt)
@@ -237,13 +242,63 @@ def should_expand(person, max_generations, stop_before_year, birth_countries):
 
 
 # --------------------------------------------------------------------------- #
+# Disk cache (also gives resume: a re-run replays cache hits, then continues)  #
+# --------------------------------------------------------------------------- #
+def _cache_path(cache_dir, pid):
+    safe = urllib.parse.quote(pid, safe="")
+    return os.path.join(cache_dir, f"{safe}.json")
+
+
+def cache_read(cache_dir, pid):
+    if not cache_dir:
+        return None
+    path = _cache_path(cache_dir, pid)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None  # corrupt/partial cache entry -> refetch
+    return None
+
+
+def cache_write(cache_dir, pid, data):
+    if not cache_dir:
+        return
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _cache_path(cache_dir, pid)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:  # atomic: never leave half files
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- #
 # Traversal                                                                    #
 # --------------------------------------------------------------------------- #
-def fetch_ancestry(pid, token, hosts, generations=8):
+def fetch_ancestry(pid, token, hosts, generations=8, cache_dir=None,
+                   refresh=False, pause=0.0, stats=None):
+    """Fetch an 8-gen ancestry chunk for pid, serving from disk cache if present.
+
+    Returns (data, from_cache). Network calls (cache misses) are cached and
+    paused; cache hits are instant -- which is what makes a re-run resume.
+    """
+    if not refresh:
+        cached = cache_read(cache_dir, pid)
+        if cached is not None:
+            if stats is not None:
+                stats["cache_hits"] += 1
+            return cached, True
     url = hosts["api"] + "/platform/tree/ancestry?" + urllib.parse.urlencode({
         "person": pid, "generations": generations, "personDetails": "true",
     })
-    return http_get(url, token, GEDCOMX)
+    data = http_get(url, token, GEDCOMX)
+    cache_write(cache_dir, pid, data)
+    if stats is not None:
+        stats["fetched"] += 1
+    if pause:
+        time.sleep(pause)
+    return data, False
 
 
 def current_person_id(token, hosts):
@@ -255,19 +310,26 @@ def current_person_id(token, hosts):
 
 
 def export_pedigree(root_pid, token, hosts, max_generations, stop_before_year,
-                    birth_countries, pause=0.5):
-    """BFS up the pedigree, re-rooting ancestry calls (FS caps at 8 gens/call)."""
+                    birth_countries, pause=0.5, cache_dir=None, refresh=False):
+    """BFS up the pedigree, re-rooting ancestry calls (FS caps at 8 gens/call).
+
+    A disk cache keyed by person id makes this resumable: if it stops (token
+    expiry, rate limit, Ctrl-C), re-running the same command replays the cached
+    chunks instantly and only fetches what is still missing.
+    """
     people = {}                      # id -> person dict (min generation kept)
     frontier = [(root_pid, 0)]       # (pid, generation) still to expand
     expanded = set()
+    stats = {"cache_hits": 0, "fetched": 0}
     while frontier:
         pid, base_gen = frontier.pop(0)
         if pid in expanded:
             continue
         expanded.add(pid)
-        sys.stderr.write(f"expanding {pid} (gen {base_gen})...\n")
-        chunk = parse_ancestry(fetch_ancestry(pid, token, hosts), gen_offset=base_gen)
-        time.sleep(pause)
+        data, from_cache = fetch_ancestry(pid, token, hosts, cache_dir=cache_dir,
+                                          refresh=refresh, pause=pause, stats=stats)
+        sys.stderr.write(f"{'cache' if from_cache else 'fetch'} {pid} (gen {base_gen})\n")
+        chunk = parse_ancestry(data, gen_offset=base_gen)
         for cid, person in chunk.items():
             prev = people.get(cid)
             if prev is None or person["generation"] < prev["generation"]:
@@ -281,6 +343,8 @@ def export_pedigree(root_pid, token, hosts, max_generations, stop_before_year,
             if person["generation"] >= max_gen_in_chunk and should_expand(
                     person, max_generations, stop_before_year, birth_countries):
                 frontier.append((cid, person["generation"]))
+    sys.stderr.write(f"ancestry chunks: {stats['fetched']} fetched, "
+                     f"{stats['cache_hits']} from cache\n")
     return people
 
 
@@ -336,6 +400,11 @@ def main():
     ap.add_argument("--out", default=os.path.join(DATA, "my_pedigree.csv"))
     ap.add_argument("--gedcom", help="also write a GEDCOM to this path")
     ap.add_argument("--pause", type=float, default=0.5, help="seconds between API calls")
+    ap.add_argument("--cache-dir", default=os.path.join(DATA, "cache", "ancestry"),
+                    help="dir for cached ancestry responses (enables resume)")
+    ap.add_argument("--no-cache", action="store_true", help="disable the disk cache")
+    ap.add_argument("--refresh", action="store_true",
+                    help="ignore cached responses and refetch (updates the cache)")
     args = ap.parse_args()
 
     hosts = HOSTS["beta" if args.beta else "prod"]
@@ -352,8 +421,10 @@ def main():
     root = args.root or current_person_id(token, hosts)
     print(f"root person: {root}")
     countries = [c for c in args.birth_countries.split(",") if c.strip()]
+    cache_dir = None if args.no_cache else args.cache_dir
     people = export_pedigree(root, token, hosts, args.max_generations,
-                             args.stop_before_year, countries, pause=args.pause)
+                             args.stop_before_year, countries, pause=args.pause,
+                             cache_dir=cache_dir, refresh=args.refresh)
 
     n = write_csv(people, args.out)
     print(f"wrote {n} direct ancestors -> {args.out}")

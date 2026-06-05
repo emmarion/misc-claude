@@ -1,4 +1,5 @@
 data/raw/
+data/cache/
 data/matches.csv
 data/my_pedigree.csv
 __pycache__/

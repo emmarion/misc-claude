@@ -4,3 +4,4 @@ data/matches.csv
 data/my_pedigree.csv
 __pycache__/
 *.pyc
+attempt*.ged
